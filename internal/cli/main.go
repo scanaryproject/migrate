@@ -4,10 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -24,13 +22,13 @@ const (
 	   Use -format option to specify a Go time format string. Note: migrations with the same time cause "duplicate migration version" error.
            Use -tz option to specify the timezone that will be used when generating non-sequential migrations (defaults: UTC).
 `
-	gotoUsage = `goto V       Migrate to version V`
-	upUsage   = `up [N]       Apply all or N up migrations`
-	downUsage = `down [N] [-all]    Apply all or N down migrations
-	Use -all to apply all down migrations`
-	dropUsage = `drop [-f]    Drop everything inside database
+	upUsage      = `up           Apply the next pending migration (exactly one)`
+	downUsage    = `down         Revert the most recently applied migration (exactly one)`
+	statusUsage  = `status       Print applied migrations (version, filename, md5, time) and pending versions`
+	forceUsage   = `force V      Record version V as applied without running it`
+	unforceUsage = `unforce V    Remove version V from the ledger without running its down migration`
+	dropUsage    = `drop [-f]    Drop everything inside database
 	Use -f to bypass confirmation`
-	forceUsage = `force V      Set version V but don't run migration (ignores dirty state)`
 )
 
 func handleSubCmdHelp(help bool, usage string, flagSet *flag.FlagSet) {
@@ -58,12 +56,20 @@ func printUsageAndExit() {
 	os.Exit(2)
 }
 
+// parseVersionArg parses the single positional version argument of a sub command.
+func parseVersionArg(fs *flag.FlagSet) uint {
+	v, err := strconv.ParseUint(fs.Arg(0), 10, 64)
+	if err != nil {
+		log.fatal("error: can't read version argument V")
+	}
+	return uint(v)
+}
+
 // Main function of a cli application. It is public for backwards compatibility with `cli` package
 func Main(version string) {
 	helpPtr := flag.Bool("help", false, "")
 	versionPtr := flag.Bool("version", false, "")
 	verbosePtr := flag.Bool("verbose", false, "")
-	prefetchPtr := flag.Uint("prefetch", 10, "")
 	lockTimeoutPtr := flag.Uint("lock-timeout", 15, "")
 	pathPtr := flag.String("path", "", "")
 	databasePtr := flag.String("database", "", "")
@@ -78,7 +84,6 @@ Options:
   -source          Location of the migrations (driver://url)
   -path            Shorthand for -source=file://path
   -database        Run migrations against this database (driver://url)
-  -prefetch N      Number of migrations to load in advance before executing (default 10)
   -lock-timeout N  Allow N seconds to acquire database lock (default 15)
   -verbose         Print verbose logging
   -version         Print version
@@ -91,10 +96,10 @@ Commands:
   %s
   %s
   %s
-  version      Print current migration version
+  %s
 
 Source drivers: `+strings.Join(source.List(), ", ")+`
-Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoUsage, upUsage, downUsage, dropUsage, forceUsage)
+Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, upUsage, downUsage, statusUsage, forceUsage, unforceUsage, dropUsage)
 	}
 
 	flag.Parse()
@@ -132,19 +137,7 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 	}()
 	if migraterErr == nil {
 		migrater.Log = log
-		migrater.PrefetchMigrations = *prefetchPtr
 		migrater.LockTimeout = time.Duration(int64(*lockTimeoutPtr)) * time.Second
-
-		// handle Ctrl+c
-		signals := make(chan os.Signal, 1)
-		signal.Notify(signals, syscall.SIGINT)
-		go func() {
-			for range signals {
-				log.Println("Stopping after this running migration ...")
-				migrater.GracefulStop <- true
-				return
-			}
-		}()
 	}
 
 	startTime := time.Now()
@@ -153,6 +146,28 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 		printUsageAndExit()
 	}
 	args := flag.Args()[1:]
+
+	// runCmd parses args for a sub command, requires a working migrater and runs f.
+	// nargs is the exact number of positional arguments the command takes.
+	runCmd := func(name, usage string, nargs int, f func(fs *flag.FlagSet) error) {
+		fs, help := newFlagSetWithHelp(name)
+		if err := fs.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
+		handleSubCmdHelp(*help, usage, fs)
+		if fs.NArg() != nargs {
+			log.fatal(fmt.Sprintf("error: %s takes exactly %d argument(s), got %d\n%s", name, nargs, fs.NArg(), usage))
+		}
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
+		if err := f(fs); err != nil {
+			log.fatalErr(err)
+		}
+		if log.verbose {
+			log.Println("Finished after", time.Since(startTime))
+		}
+	}
 
 	switch flag.Arg(0) {
 	case "create":
@@ -192,106 +207,20 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 			log.fatalErr(err)
 		}
 
-	case "goto":
-
-		gotoSet, helpPtr := newFlagSetWithHelp("goto")
-
-		if err := gotoSet.Parse(args); err != nil {
-			log.fatalErr(err)
-		}
-
-		handleSubCmdHelp(*helpPtr, gotoUsage, gotoSet)
-
-		if migraterErr != nil {
-			log.fatalErr(migraterErr)
-		}
-
-		if gotoSet.NArg() == 0 {
-			log.fatal("error: please specify version argument V")
-		}
-
-		v, err := strconv.ParseUint(gotoSet.Arg(0), 10, 64)
-		if err != nil {
-			log.fatal("error: can't read version argument V")
-		}
-
-		if err := gotoCmd(migrater, uint(v)); err != nil {
-			log.fatalErr(err)
-		}
-
-		if log.verbose {
-			log.Println("Finished after", time.Since(startTime))
-		}
-
 	case "up":
-		upSet, helpPtr := newFlagSetWithHelp("up")
-
-		if err := upSet.Parse(args); err != nil {
-			log.fatalErr(err)
-		}
-
-		handleSubCmdHelp(*helpPtr, upUsage, upSet)
-
-		if migraterErr != nil {
-			log.fatalErr(migraterErr)
-		}
-
-		limit := -1
-		if upSet.NArg() > 0 {
-			n, err := strconv.ParseUint(upSet.Arg(0), 10, 64)
-			if err != nil {
-				log.fatal("error: can't read limit argument N")
-			}
-			limit = int(n)
-		}
-
-		if err := upCmd(migrater, limit); err != nil {
-			log.fatalErr(err)
-		}
-
-		if log.verbose {
-			log.Println("Finished after", time.Since(startTime))
-		}
+		runCmd("up", upUsage, 0, func(*flag.FlagSet) error { return upCmd(migrater) })
 
 	case "down":
-		downFlagSet, helpPtr := newFlagSetWithHelp("down")
-		applyAll := downFlagSet.Bool("all", false, "Apply all down migrations")
+		runCmd("down", downUsage, 0, func(*flag.FlagSet) error { return downCmd(migrater) })
 
-		if err := downFlagSet.Parse(args); err != nil {
-			log.fatalErr(err)
-		}
+	case "status":
+		runCmd("status", statusUsage, 0, func(*flag.FlagSet) error { return statusCmd(migrater, os.Stdout) })
 
-		handleSubCmdHelp(*helpPtr, downUsage, downFlagSet)
+	case "force":
+		runCmd("force", forceUsage, 1, func(fs *flag.FlagSet) error { return forceCmd(migrater, parseVersionArg(fs)) })
 
-		if migraterErr != nil {
-			log.fatalErr(migraterErr)
-		}
-
-		downArgs := downFlagSet.Args()
-		num, needsConfirm, err := numDownMigrationsFromArgs(*applyAll, downArgs)
-		if err != nil {
-			log.fatalErr(err)
-		}
-		if needsConfirm {
-			log.Println("Are you sure you want to apply all down migrations? [y/N]")
-			var response string
-			_, _ = fmt.Scanln(&response)
-			response = strings.ToLower(strings.TrimSpace(response))
-
-			if response == "y" {
-				log.Println("Applying all down migrations")
-			} else {
-				log.fatal("Not applying all down migrations")
-			}
-		}
-
-		if err := downCmd(migrater, num); err != nil {
-			log.fatalErr(err)
-		}
-
-		if log.verbose {
-			log.Println("Finished after", time.Since(startTime))
-		}
+	case "unforce":
+		runCmd("unforce", unforceUsage, 1, func(fs *flag.FlagSet) error { return unforceCmd(migrater, parseVersionArg(fs)) })
 
 	case "drop":
 		dropFlagSet, help := newFlagSetWithHelp("drop")
@@ -326,49 +255,6 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
 
 		if log.verbose {
 			log.Println("Finished after", time.Since(startTime))
-		}
-
-	case "force":
-		forceSet, helpPtr := newFlagSetWithHelp("force")
-
-		if err := forceSet.Parse(args); err != nil {
-			log.fatalErr(err)
-		}
-
-		handleSubCmdHelp(*helpPtr, forceUsage, forceSet)
-
-		if migraterErr != nil {
-			log.fatalErr(migraterErr)
-		}
-
-		if forceSet.NArg() == 0 {
-			log.fatal("error: please specify version argument V")
-		}
-
-		v, err := strconv.ParseInt(forceSet.Arg(0), 10, 64)
-		if err != nil {
-			log.fatal("error: can't read version argument V")
-		}
-
-		if v < -1 {
-			log.fatal("error: argument V must be >= -1")
-		}
-
-		if err := forceCmd(migrater, int(v)); err != nil {
-			log.fatalErr(err)
-		}
-
-		if log.verbose {
-			log.Println("Finished after", time.Since(startTime))
-		}
-
-	case "version":
-		if migraterErr != nil {
-			log.fatalErr(migraterErr)
-		}
-
-		if err := versionCmd(migrater); err != nil {
-			log.fatalErr(err)
 		}
 
 	default:

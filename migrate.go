@@ -2,11 +2,20 @@
 // Sources are defined by the `source.Driver` and databases by the `database.Driver`
 // interface. The driver interfaces are kept "dumb", all migration logic is kept
 // in this package.
+//
+// The model is Liquibase-like: the database keeps one ledger row per applied
+// migration (version, filename, md5sum, time_applied). Up and Down move exactly
+// one migration per call. Before every step the ledger is validated against the
+// local source: every applied version must still exist locally with the same
+// md5, and no local version below the highest applied one may be unapplied.
 package migrate
 
 import (
+	"crypto/md5" // #nosec G501 -- checksum for change detection, not security
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -16,41 +25,62 @@ import (
 	"github.com/golang-migrate/migrate/v4/source"
 )
 
-// DefaultPrefetchMigrations sets the number of migrations to pre-read
-// from the source. This is helpful if the source is remote, but has little
-// effect for a local source (i.e. file system).
-// Please note that this setting has a major impact on the memory usage,
-// since each pre-read migration is buffered in memory. See DefaultBufferSize.
-var DefaultPrefetchMigrations = uint(10)
-
 // DefaultLockTimeout sets the max time a database driver has to acquire a lock.
 var DefaultLockTimeout = 15 * time.Second
 
 var (
-	ErrNoChange       = errors.New("no change")
-	ErrNilVersion     = errors.New("no migration")
-	ErrInvalidVersion = errors.New("version must be >= -1")
-	ErrLocked         = errors.New("database locked")
-	ErrLockTimeout    = errors.New("timeout: can't acquire database lock")
+	ErrNoChange    = errors.New("no change")
+	ErrLocked      = errors.New("database locked")
+	ErrLockTimeout = errors.New("timeout: can't acquire database lock")
 )
 
-// ErrShortLimit is an error returned when not enough migrations
-// can be returned by a source for a given limit.
-type ErrShortLimit struct {
-	Short uint
+// ErrChecksumMismatch: an applied migration's local up file changed since it was applied.
+type ErrChecksumMismatch struct {
+	Version  uint
+	Filename string
+	Applied  string
+	Local    string
 }
 
-// Error implements the error interface.
-func (e ErrShortLimit) Error() string {
-	return fmt.Sprintf("limit %v short", e.Short)
+func (e ErrChecksumMismatch) Error() string {
+	return fmt.Sprintf("checksum mismatch for version %d (%s): applied md5 %s, local md5 %s", e.Version, e.Filename, e.Applied, e.Local)
 }
 
-type ErrDirty struct {
-	Version int
+// ErrMissingLocal: ledger has a version with no local up migration.
+type ErrMissingLocal struct {
+	Version  uint
+	Filename string
 }
 
-func (e ErrDirty) Error() string {
-	return fmt.Sprintf("Dirty database version %v. Fix and force version.", e.Version)
+func (e ErrMissingLocal) Error() string {
+	return fmt.Sprintf("version %d (%s) is applied in database but has no local up migration", e.Version, e.Filename)
+}
+
+// ErrOutOfOrder: a local version lower than the highest applied one was never applied.
+type ErrOutOfOrder struct {
+	Version    uint
+	MaxApplied uint
+}
+
+func (e ErrOutOfOrder) Error() string {
+	return fmt.Sprintf("local version %d is not applied but version %d already is; migrations must be applied in order", e.Version, e.MaxApplied)
+}
+
+// ErrNoDownMigration: Down requested but the source has no down file for the version.
+type ErrNoDownMigration struct {
+	Version uint
+}
+
+func (e ErrNoDownMigration) Error() string {
+	return fmt.Sprintf("no down migration for version %d", e.Version)
+}
+
+// Status is the result of comparing ledger and source.
+type Status struct {
+	// Applied rows from the ledger, ascending by version.
+	Applied []database.AppliedMigration
+	// Pending local versions above the highest applied one, ascending.
+	Pending []uint
 }
 
 type Migrate struct {
@@ -62,22 +92,12 @@ type Migrate struct {
 	// Log accepts a Logger interface
 	Log Logger
 
-	// GracefulStop accepts `true` and will stop executing migrations
-	// as soon as possible at a safe break point, so that the database
-	// is not corrupted.
-	GracefulStop chan bool
-	isLockedMu   *sync.Mutex
-
-	isGracefulStop bool
-	isLocked       bool
-
-	// PrefetchMigrations defaults to DefaultPrefetchMigrations,
-	// but can be set per Migrate instance.
-	PrefetchMigrations uint
-
 	// LockTimeout defaults to DefaultLockTimeout,
 	// but can be set per Migrate instance.
 	LockTimeout time.Duration
+
+	isLockedMu *sync.Mutex
+	isLocked   bool
 }
 
 // New returns a new Migrate instance from a source URL and a database URL.
@@ -124,7 +144,6 @@ func NewWithDatabaseInstance(sourceURL string, databaseDriverName string, databa
 		return nil, err
 	}
 	m.sourceName = sourceName
-
 	m.databaseDriverName = databaseDriverName
 
 	sourceDrv, err := source.Open(sourceURL)
@@ -132,7 +151,6 @@ func NewWithDatabaseInstance(sourceURL string, databaseDriverName string, databa
 		return nil, fmt.Errorf("failed to open source, %q: %w", sourceURL, err)
 	}
 	m.sourceDrv = sourceDrv
-
 	m.databaseDrv = databaseInstance
 
 	return m, nil
@@ -150,7 +168,6 @@ func NewWithSourceInstance(sourceName string, sourceInstance source.Driver, data
 		return nil, fmt.Errorf("failed to parse scheme from database URL: %w", err)
 	}
 	m.databaseDriverName = databaseDriverName
-
 	m.sourceName = sourceName
 
 	databaseDrv, err := database.Open(databaseURL)
@@ -158,7 +175,6 @@ func NewWithSourceInstance(sourceName string, sourceInstance source.Driver, data
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
 	m.databaseDrv = databaseDrv
-
 	m.sourceDrv = sourceInstance
 
 	return m, nil
@@ -173,7 +189,6 @@ func NewWithInstance(sourceName string, sourceInstance source.Driver, databaseDr
 
 	m.sourceName = sourceName
 	m.databaseDriverName = databaseDriverName
-
 	m.sourceDrv = sourceInstance
 	m.databaseDrv = databaseInstance
 
@@ -182,10 +197,8 @@ func NewWithInstance(sourceName string, sourceInstance source.Driver, databaseDr
 
 func newCommon() *Migrate {
 	return &Migrate{
-		GracefulStop:       make(chan bool, 1),
-		PrefetchMigrations: DefaultPrefetchMigrations,
-		LockTimeout:        DefaultLockTimeout,
-		isLockedMu:         &sync.Mutex{},
+		LockTimeout: DefaultLockTimeout,
+		isLockedMu:  &sync.Mutex{},
 	}
 }
 
@@ -207,100 +220,141 @@ func (m *Migrate) Close() (source error, database error) {
 	return <-sourceSrvClose, <-databaseSrvClose
 }
 
-// Migrate looks at the currently active migration version,
-// then migrates either up or down to the specified version.
-func (m *Migrate) Migrate(version uint) error {
-	if err := m.lock(); err != nil {
-		return err
-	}
-
-	curVersion, dirty, err := m.databaseDrv.Version()
-	if err != nil {
-		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
-	}
-
-	ret := make(chan interface{}, m.PrefetchMigrations)
-	go m.read(curVersion, int(version), ret)
-
-	return m.unlockErr(m.runMigrations(ret))
-}
-
-// Steps looks at the currently active migration version.
-// It will migrate up if n > 0, and down if n < 0.
-func (m *Migrate) Steps(n int) error {
-	if n == 0 {
-		return ErrNoChange
-	}
-
-	if err := m.lock(); err != nil {
-		return err
-	}
-
-	curVersion, dirty, err := m.databaseDrv.Version()
-	if err != nil {
-		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
-	}
-
-	ret := make(chan interface{}, m.PrefetchMigrations)
-
-	if n > 0 {
-		go m.readUp(curVersion, n, ret)
-	} else {
-		go m.readDown(curVersion, -n, ret)
-	}
-
-	return m.unlockErr(m.runMigrations(ret))
-}
-
-// Up looks at the currently active migration version
-// and will migrate all the way up (applying all up migrations).
+// Up validates the ledger and applies exactly one pending migration.
+// Returns ErrNoChange when nothing is pending.
 func (m *Migrate) Up() error {
 	if err := m.lock(); err != nil {
 		return err
 	}
-
-	curVersion, dirty, err := m.databaseDrv.Version()
-	if err != nil {
-		return m.unlockErr(err)
-	}
-
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
-	}
-
-	ret := make(chan interface{}, m.PrefetchMigrations)
-
-	go m.readUp(curVersion, -1, ret)
-	return m.unlockErr(m.runMigrations(ret))
+	return m.unlockErr(m.up())
 }
 
-// Down looks at the currently active migration version
-// and will migrate all the way down (applying all down migrations).
+func (m *Migrate) up() error {
+	st, err := m.status()
+	if err != nil {
+		return err
+	}
+	if len(st.Pending) == 0 {
+		return ErrNoChange
+	}
+	v := st.Pending[0]
+
+	body, filename, err := m.readUp(v)
+	if err != nil {
+		return err
+	}
+
+	start := time.Now()
+	row := database.AppliedMigration{Version: v, Filename: filename, MD5Sum: md5hex(body)}
+	if err := m.databaseDrv.Apply(row, body); err != nil {
+		return err
+	}
+	m.logPrintf("%d/u %s (%v)\n", v, filename, time.Since(start))
+	return nil
+}
+
+// Down validates the ledger and reverts exactly the highest applied migration.
+// Returns ErrNoChange when the ledger is empty.
 func (m *Migrate) Down() error {
 	if err := m.lock(); err != nil {
 		return err
 	}
+	return m.unlockErr(m.down())
+}
 
-	curVersion, dirty, err := m.databaseDrv.Version()
+func (m *Migrate) down() error {
+	st, err := m.status()
 	if err != nil {
-		return m.unlockErr(err)
+		return err
+	}
+	if len(st.Applied) == 0 {
+		return ErrNoChange
+	}
+	v := st.Applied[len(st.Applied)-1].Version
+
+	r, filename, err := m.sourceDrv.ReadDown(v)
+	if errors.Is(err, os.ErrNotExist) {
+		return ErrNoDownMigration{v}
+	}
+	if err != nil {
+		return err
+	}
+	body, err := readAll(r)
+	if err != nil {
+		return err
 	}
 
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
+	start := time.Now()
+	if err := m.databaseDrv.Revert(v, body); err != nil {
+		return err
 	}
+	m.logPrintf("%d/d %s (%v)\n", v, filename, time.Since(start))
+	return nil
+}
 
-	ret := make(chan interface{}, m.PrefetchMigrations)
-	go m.readDown(curVersion, -1, ret)
-	return m.unlockErr(m.runMigrations(ret))
+// Status validates the ledger against the source and reports applied and pending versions.
+func (m *Migrate) Status() (Status, error) {
+	if err := m.lock(); err != nil {
+		return Status{}, err
+	}
+	st, err := m.status()
+	return st, m.unlockErr(err)
+}
+
+// Force records version as applied (with the md5 of the local up file) without running it.
+// The version must exist locally and must not be applied yet.
+func (m *Migrate) Force(version uint) error {
+	if err := m.lock(); err != nil {
+		return err
+	}
+	return m.unlockErr(m.force(version))
+}
+
+func (m *Migrate) force(version uint) error {
+	applied, err := m.databaseDrv.Applied()
+	if err != nil {
+		return err
+	}
+	for _, a := range applied {
+		if a.Version == version {
+			return fmt.Errorf("version %d is already applied", version)
+		}
+	}
+	body, filename, err := m.readUp(version)
+	if err != nil {
+		return err
+	}
+	row := database.AppliedMigration{Version: version, Filename: filename, MD5Sum: md5hex(body)}
+	if err := m.databaseDrv.Apply(row, nil); err != nil {
+		return err
+	}
+	m.logPrintf("%d/u %s (forced, not run)\n", version, filename)
+	return nil
+}
+
+// Unforce deletes the ledger row for version without running the down migration.
+func (m *Migrate) Unforce(version uint) error {
+	if err := m.lock(); err != nil {
+		return err
+	}
+	return m.unlockErr(m.unforce(version))
+}
+
+func (m *Migrate) unforce(version uint) error {
+	applied, err := m.databaseDrv.Applied()
+	if err != nil {
+		return err
+	}
+	for _, a := range applied {
+		if a.Version == version {
+			if err := m.databaseDrv.Revert(version, nil); err != nil {
+				return err
+			}
+			m.logPrintf("%d/d %s (unforced, not run)\n", version, a.Filename)
+			return nil
+		}
+	}
+	return fmt.Errorf("version %d is not applied", version)
 }
 
 // Drop deletes everything in the database.
@@ -314,572 +368,101 @@ func (m *Migrate) Drop() error {
 	return m.unlock()
 }
 
-// Run runs any migration provided by you against the database.
-// It does not check any currently active version in database.
-// Usually you don't need this function at all. Use Migrate,
-// Steps, Up or Down instead.
-func (m *Migrate) Run(migration ...*Migration) error {
-	if len(migration) == 0 {
-		return ErrNoChange
-	}
-
-	if err := m.lock(); err != nil {
-		return err
-	}
-
-	curVersion, dirty, err := m.databaseDrv.Version()
+// status loads ledger and source, validates them, and computes pending versions.
+// Caller must hold the lock.
+func (m *Migrate) status() (Status, error) {
+	applied, err := m.databaseDrv.Applied()
 	if err != nil {
-		return m.unlockErr(err)
+		return Status{}, err
+	}
+	local, err := m.localVersions()
+	if err != nil {
+		return Status{}, err
 	}
 
-	if dirty {
-		return m.unlockErr(ErrDirty{curVersion})
+	// every applied version must exist locally with the same md5
+	for _, a := range applied {
+		body, _, err := m.readUp(a.Version)
+		if errors.Is(err, os.ErrNotExist) {
+			return Status{}, ErrMissingLocal{a.Version, a.Filename}
+		}
+		if err != nil {
+			return Status{}, err
+		}
+		if sum := md5hex(body); sum != a.MD5Sum {
+			return Status{}, ErrChecksumMismatch{a.Version, a.Filename, a.MD5Sum, sum}
+		}
 	}
 
-	ret := make(chan interface{}, m.PrefetchMigrations)
+	st := Status{Applied: applied}
+	if len(applied) == 0 {
+		st.Pending = local
+		return st, nil
+	}
 
-	go func() {
-		defer close(ret)
-		for _, migr := range migration {
-			if m.PrefetchMigrations > 0 && migr.Body != nil {
-				m.logVerbosePrintf("Start buffering %v\n", migr.LogString())
-			} else {
-				m.logVerbosePrintf("Scheduled %v\n", migr.LogString())
-			}
+	// no local version at or below max applied may be unapplied
+	maxApplied := applied[len(applied)-1].Version
+	isApplied := make(map[uint]bool, len(applied))
+	for _, a := range applied {
+		isApplied[a.Version] = true
+	}
+	st.Pending = make([]uint, 0, len(local))
+	for _, v := range local {
+		switch {
+		case v > maxApplied:
+			st.Pending = append(st.Pending, v)
+		case !isApplied[v]:
+			return Status{}, ErrOutOfOrder{v, maxApplied}
+		}
+	}
+	return st, nil
+}
 
-			ret <- migr
-			go func(migr *Migration) {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}(migr)
+// localVersions lists every version known to the source, ascending.
+func (m *Migrate) localVersions() ([]uint, error) {
+	versions := make([]uint, 0)
+	v, err := m.sourceDrv.First()
+	if errors.Is(err, os.ErrNotExist) {
+		return versions, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for {
+		versions = append(versions, v)
+		v, err = m.sourceDrv.Next(v)
+		if errors.Is(err, os.ErrNotExist) {
+			return versions, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+// readUp reads the whole up migration body for version.
+// Returns an error wrapping os.ErrNotExist if the source has no up file.
+func (m *Migrate) readUp(version uint) (body []byte, filename string, err error) {
+	r, filename, err := m.sourceDrv.ReadUp(version)
+	if err != nil {
+		return nil, "", err
+	}
+	body, err = readAll(r)
+	return body, filename, err
+}
+
+func readAll(r io.ReadCloser) (body []byte, err error) {
+	defer func() {
+		if cerr := r.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
 		}
 	}()
-
-	return m.unlockErr(m.runMigrations(ret))
+	return io.ReadAll(r)
 }
 
-// Force sets a migration version.
-// It does not check any currently active version in database.
-// It resets the dirty state to false.
-func (m *Migrate) Force(version int) error {
-	if version < -1 {
-		return ErrInvalidVersion
-	}
-
-	if err := m.lock(); err != nil {
-		return err
-	}
-
-	if err := m.databaseDrv.SetVersion(version, false); err != nil {
-		return m.unlockErr(err)
-	}
-
-	return m.unlock()
-}
-
-// Version returns the currently active migration version.
-// If no migration has been applied, yet, it will return ErrNilVersion.
-func (m *Migrate) Version() (version uint, dirty bool, err error) {
-	v, d, err := m.databaseDrv.Version()
-	if err != nil {
-		return 0, false, err
-	}
-
-	if v == database.NilVersion {
-		return 0, false, ErrNilVersion
-	}
-
-	return suint(v), d, nil
-}
-
-// read reads either up or down migrations from source `from` to `to`.
-// Each migration is then written to the ret channel.
-// If an error occurs during reading, that error is written to the ret channel, too.
-// Once read is done reading it will close the ret channel.
-func (m *Migrate) read(from int, to int, ret chan<- interface{}) {
-	defer close(ret)
-
-	// check if from version exists
-	if from >= 0 {
-		if err := m.versionExists(suint(from)); err != nil {
-			ret <- err
-			return
-		}
-	}
-
-	// check if to version exists
-	if to >= 0 {
-		if err := m.versionExists(suint(to)); err != nil {
-			ret <- err
-			return
-		}
-	}
-
-	// no change?
-	if from == to {
-		ret <- ErrNoChange
-		return
-	}
-
-	if from < to {
-		// it's going up
-		// apply first migration if from is nil version
-		if from == -1 {
-			firstVersion, err := m.sourceDrv.First()
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			migr, err := m.newMigration(firstVersion, int(firstVersion))
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
-
-			from = int(firstVersion)
-		}
-
-		// run until we reach target ...
-		for from < to {
-			if m.stop() {
-				return
-			}
-
-			next, err := m.sourceDrv.Next(suint(from))
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			migr, err := m.newMigration(next, int(next))
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
-
-			from = int(next)
-		}
-
-	} else {
-		// it's going down
-		// run until we reach target ...
-		for from > to && from >= 0 {
-			if m.stop() {
-				return
-			}
-
-			prev, err := m.sourceDrv.Prev(suint(from))
-			if errors.Is(err, os.ErrNotExist) && to == -1 {
-				// apply nil migration
-				migr, err := m.newMigration(suint(from), -1)
-				if err != nil {
-					ret <- err
-					return
-				}
-				ret <- migr
-				go func() {
-					if err := migr.Buffer(); err != nil {
-						m.logErr(err)
-					}
-				}()
-
-				return
-
-			} else if err != nil {
-				ret <- err
-				return
-			}
-
-			migr, err := m.newMigration(suint(from), int(prev))
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
-
-			from = int(prev)
-		}
-	}
-}
-
-// readUp reads up migrations from `from` limited by `limit`.
-// limit can be -1, implying no limit and reading until there are no more migrations.
-// Each migration is then written to the ret channel.
-// If an error occurs during reading, that error is written to the ret channel, too.
-// Once readUp is done reading it will close the ret channel.
-func (m *Migrate) readUp(from int, limit int, ret chan<- interface{}) {
-	defer close(ret)
-
-	// check if from version exists
-	if from >= 0 {
-		if err := m.versionExists(suint(from)); err != nil {
-			ret <- err
-			return
-		}
-	}
-
-	if limit == 0 {
-		ret <- ErrNoChange
-		return
-	}
-
-	count := 0
-	for count < limit || limit == -1 {
-		if m.stop() {
-			return
-		}
-
-		// apply first migration if from is nil version
-		if from == -1 {
-			firstVersion, err := m.sourceDrv.First()
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			migr, err := m.newMigration(firstVersion, int(firstVersion))
-			if err != nil {
-				ret <- err
-				return
-			}
-
-			ret <- migr
-			go func() {
-				if err := migr.Buffer(); err != nil {
-					m.logErr(err)
-				}
-			}()
-			from = int(firstVersion)
-			count++
-			continue
-		}
-
-		// apply next migration
-		next, err := m.sourceDrv.Next(suint(from))
-		if errors.Is(err, os.ErrNotExist) {
-			// no limit, but no migrations applied?
-			if limit == -1 && count == 0 {
-				ret <- ErrNoChange
-				return
-			}
-
-			// no limit, reached end
-			if limit == -1 {
-				return
-			}
-
-			// reached end, and didn't apply any migrations
-			if limit > 0 && count == 0 {
-				ret <- os.ErrNotExist
-				return
-			}
-
-			// applied less migrations than limit?
-			if count < limit {
-				ret <- ErrShortLimit{suint(limit - count)}
-				return
-			}
-		}
-		if err != nil {
-			ret <- err
-			return
-		}
-
-		migr, err := m.newMigration(next, int(next))
-		if err != nil {
-			ret <- err
-			return
-		}
-
-		ret <- migr
-		go func() {
-			if err := migr.Buffer(); err != nil {
-				m.logErr(err)
-			}
-		}()
-		from = int(next)
-		count++
-	}
-}
-
-// readDown reads down migrations from `from` limited by `limit`.
-// limit can be -1, implying no limit and reading until there are no more migrations.
-// Each migration is then written to the ret channel.
-// If an error occurs during reading, that error is written to the ret channel, too.
-// Once readDown is done reading it will close the ret channel.
-func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
-	defer close(ret)
-
-	// check if from version exists
-	if from >= 0 {
-		if err := m.versionExists(suint(from)); err != nil {
-			ret <- err
-			return
-		}
-	}
-
-	if limit == 0 {
-		ret <- ErrNoChange
-		return
-	}
-
-	// no change if already at nil version
-	if from == -1 && limit == -1 {
-		ret <- ErrNoChange
-		return
-	}
-
-	// can't go over limit if already at nil version
-	if from == -1 && limit > 0 {
-		ret <- os.ErrNotExist
-		return
-	}
-
-	count := 0
-	for count < limit || limit == -1 {
-		if m.stop() {
-			return
-		}
-
-		prev, err := m.sourceDrv.Prev(suint(from))
-		if errors.Is(err, os.ErrNotExist) {
-			// no limit or haven't reached limit, apply "first" migration
-			if limit == -1 || limit-count > 0 {
-				firstVersion, err := m.sourceDrv.First()
-				if err != nil {
-					ret <- err
-					return
-				}
-
-				migr, err := m.newMigration(firstVersion, -1)
-				if err != nil {
-					ret <- err
-					return
-				}
-				ret <- migr
-				go func() {
-					if err := migr.Buffer(); err != nil {
-						m.logErr(err)
-					}
-				}()
-				count++
-			}
-
-			if count < limit {
-				ret <- ErrShortLimit{suint(limit - count)}
-			}
-			return
-		}
-		if err != nil {
-			ret <- err
-			return
-		}
-
-		migr, err := m.newMigration(suint(from), int(prev))
-		if err != nil {
-			ret <- err
-			return
-		}
-
-		ret <- migr
-		go func() {
-			if err := migr.Buffer(); err != nil {
-				m.logErr(err)
-			}
-		}()
-		from = int(prev)
-		count++
-	}
-}
-
-// runMigrations reads *Migration and error from a channel. Any other type
-// sent on this channel will result in a panic. Each migration is then
-// proxied to the database driver and run against the database.
-// Before running a newly received migration it will check if it's supposed
-// to stop execution because it might have received a stop signal on the
-// GracefulStop channel.
-func (m *Migrate) runMigrations(ret <-chan interface{}) error {
-	for r := range ret {
-
-		if m.stop() {
-			return nil
-		}
-
-		switch r := r.(type) {
-		case error:
-			return r
-
-		case *Migration:
-			migr := r
-
-			// set version with dirty state
-			if err := m.databaseDrv.SetVersion(migr.TargetVersion, true); err != nil {
-				return err
-			}
-
-			if migr.Body != nil {
-				m.logVerbosePrintf("Read and execute %v\n", migr.LogString())
-				if err := m.databaseDrv.Run(migr.BufferedBody); err != nil {
-					return err
-				}
-			}
-
-			// set clean state
-			if err := m.databaseDrv.SetVersion(migr.TargetVersion, false); err != nil {
-				return err
-			}
-
-			endTime := time.Now()
-			readTime := migr.FinishedReading.Sub(migr.StartedBuffering)
-			runTime := endTime.Sub(migr.FinishedReading)
-
-			// log either verbose or normal
-			if m.Log != nil {
-				if m.Log.Verbose() {
-					m.logPrintf("Finished %v (read %v, ran %v)\n", migr.LogString(), readTime, runTime)
-				} else {
-					m.logPrintf("%v (%v)\n", migr.LogString(), readTime+runTime)
-				}
-			}
-
-		default:
-			return fmt.Errorf("unknown type: %T with value: %+v", r, r)
-		}
-	}
-	return nil
-}
-
-// versionExists checks the source if either the up or down migration for
-// the specified migration version exists.
-func (m *Migrate) versionExists(version uint) (result error) {
-	// try up migration first
-	up, _, err := m.sourceDrv.ReadUp(version)
-	if err == nil {
-		defer func() {
-			if errClose := up.Close(); errClose != nil {
-				result = errors.Join(result, errClose)
-			}
-		}()
-	}
-	if errors.Is(err, os.ErrExist) {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	// then try down migration
-	down, _, err := m.sourceDrv.ReadDown(version)
-	if err == nil {
-		defer func() {
-			if errClose := down.Close(); errClose != nil {
-				result = errors.Join(result, errClose)
-			}
-		}()
-	}
-	if errors.Is(err, os.ErrExist) {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	err = fmt.Errorf("no migration found for version %d: %w", version, err)
-	m.logErr(err)
-	return err
-}
-
-// stop returns true if no more migrations should be run against the database
-// because a stop signal was received on the GracefulStop channel.
-// Calls are cheap and this function is not blocking.
-func (m *Migrate) stop() bool {
-	if m.isGracefulStop {
-		return true
-	}
-
-	select {
-	case <-m.GracefulStop:
-		m.isGracefulStop = true
-		return true
-
-	default:
-		return false
-	}
-}
-
-// newMigration is a helper func that returns a *Migration for the
-// specified version and targetVersion.
-func (m *Migrate) newMigration(version uint, targetVersion int) (*Migration, error) {
-	var migr *Migration
-
-	if targetVersion >= int(version) {
-		r, identifier, err := m.sourceDrv.ReadUp(version)
-		if errors.Is(err, os.ErrNotExist) {
-			// create "empty" migration
-			migr, err = NewMigration(nil, "", version, targetVersion)
-			if err != nil {
-				return nil, err
-			}
-
-		} else if err != nil {
-			return nil, err
-
-		} else {
-			// create migration from up source
-			migr, err = NewMigration(r, identifier, version, targetVersion)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-	} else {
-		r, identifier, err := m.sourceDrv.ReadDown(version)
-		if errors.Is(err, os.ErrNotExist) {
-			// create "empty" migration
-			migr, err = NewMigration(nil, "", version, targetVersion)
-			if err != nil {
-				return nil, err
-			}
-
-		} else if err != nil {
-			return nil, err
-
-		} else {
-			// create migration from down source
-			migr, err = NewMigration(r, identifier, version, targetVersion)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	if m.PrefetchMigrations > 0 && migr.Body != nil {
-		m.logVerbosePrintf("Start buffering %v\n", migr.LogString())
-	} else {
-		m.logVerbosePrintf("Scheduled %v\n", migr.LogString())
-	}
-
-	return migr, nil
+func md5hex(b []byte) string {
+	sum := md5.Sum(b) // #nosec G401 -- change detection only
+	return hex.EncodeToString(sum[:])
 }
 
 // lock is a thread safe helper function to lock the database.
@@ -968,12 +551,5 @@ func (m *Migrate) logPrintf(format string, v ...interface{}) {
 func (m *Migrate) logVerbosePrintf(format string, v ...interface{}) {
 	if m.Log != nil && m.Log.Verbose() {
 		m.Log.Printf(format, v...)
-	}
-}
-
-// logErr writes error to m.Log if not nil
-func (m *Migrate) logErr(err error) {
-	if m.Log != nil {
-		m.Log.Printf("error: %v", err)
 	}
 }

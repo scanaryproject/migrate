@@ -1,7 +1,6 @@
 package database
 
 import (
-	"io"
 	"testing"
 )
 
@@ -36,16 +35,16 @@ func (m *mockDriver) Unlock() error {
 	return nil
 }
 
-func (m *mockDriver) Run(migration io.Reader) error {
+func (m *mockDriver) Applied() ([]AppliedMigration, error) {
+	return nil, nil
+}
+
+func (m *mockDriver) Apply(AppliedMigration, []byte) error {
 	return nil
 }
 
-func (m *mockDriver) SetVersion(version int, dirty bool) error {
+func (m *mockDriver) Revert(uint, []byte) error {
 	return nil
-}
-
-func (m *mockDriver) Version() (version int, dirty bool, err error) {
-	return 0, false, nil
 }
 
 func (m *mockDriver) Drop() error {
