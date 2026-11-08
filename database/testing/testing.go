@@ -4,10 +4,8 @@
 package testing
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"testing"
 	"time"
 
@@ -20,21 +18,20 @@ func Test(t *testing.T, d database.Driver, migration []byte) {
 		t.Fatal("test must provide migration reader")
 	}
 
-	TestNilVersion(t, d) // test first
+	TestEmptyLedger(t, d) // test first
 	TestLockAndUnlock(t, d)
-	TestRun(t, d, bytes.NewReader(migration))
-	TestSetVersion(t, d) // also tests Version()
+	TestApplyRevert(t, d, migration)
 	// Drop breaks the driver, so test it last.
 	TestDrop(t, d)
 }
 
-func TestNilVersion(t *testing.T, d database.Driver) {
-	v, _, err := d.Version()
+func TestEmptyLedger(t *testing.T, d database.Driver) {
+	rows, err := d.Applied()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != database.NilVersion {
-		t.Fatalf("Version: expected version to be NilVersion (-1), got %v", v)
+	if len(rows) != 0 {
+		t.Fatalf("Applied: expected empty ledger, got %v", rows)
 	}
 }
 
@@ -99,56 +96,55 @@ func TestLockAndUnlock(t *testing.T, d database.Driver) {
 	}
 }
 
-func TestRun(t *testing.T, d database.Driver, migration io.Reader) {
-	if migration == nil {
-		t.Fatal("migration can't be nil")
+// TestApplyRevert applies a real migration, a record-only one, then reverts both.
+func TestApplyRevert(t *testing.T, d database.Driver, migration []byte) {
+	m1 := database.AppliedMigration{Version: 1, Filename: "1_test.up.sql", MD5Sum: "0123456789abcdef0123456789abcdef"}
+	if err := d.Apply(m1, migration); err != nil {
+		t.Fatal(err)
+	}
+	m2 := database.AppliedMigration{Version: 2, Filename: "2_forced.up.sql", MD5Sum: "fedcba9876543210fedcba9876543210"}
+	if err := d.Apply(m2, nil); err != nil {
+		t.Fatal(err)
 	}
 
-	if err := d.Run(migration); err != nil {
+	rows, err := d.Applied()
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("Applied: expected 2 rows, got %d: %v", len(rows), rows)
+	}
+	for i, want := range []database.AppliedMigration{m1, m2} {
+		got := rows[i]
+		if got.Version != want.Version || got.Filename != want.Filename || got.MD5Sum != want.MD5Sum {
+			t.Errorf("row %d: got %+v want %+v", i, got, want)
+		}
+		if got.AppliedAt.IsZero() {
+			t.Errorf("row %d: AppliedAt not set", i)
+		}
+	}
+
+	if err := d.Apply(m2, nil); err == nil {
+		t.Error("Apply: expected error on duplicate version")
+	}
+
+	if err := d.Revert(2, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Revert(1, []byte("")); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = d.Applied()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("Applied: expected empty ledger after revert, got %v", rows)
 	}
 }
 
 func TestDrop(t *testing.T, d database.Driver) {
 	if err := d.Drop(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestSetVersion(t *testing.T, d database.Driver) {
-	testCases := []struct {
-		name            string
-		version         int
-		dirty           bool
-		expectedErr     error
-		expectedReadErr error
-		expectedVersion int
-		expectedDirty   bool
-	}{
-		{name: "set 1 dirty", version: 1, dirty: true, expectedErr: nil, expectedReadErr: nil, expectedVersion: 1, expectedDirty: true},
-		{name: "re-set 1 dirty", version: 1, dirty: true, expectedErr: nil, expectedReadErr: nil, expectedVersion: 1, expectedDirty: true},
-		{name: "set 2 clean", version: 2, dirty: false, expectedErr: nil, expectedReadErr: nil, expectedVersion: 2, expectedDirty: false},
-		{name: "re-set 2 clean", version: 2, dirty: false, expectedErr: nil, expectedReadErr: nil, expectedVersion: 2, expectedDirty: false},
-		{name: "last migration dirty", version: database.NilVersion, dirty: true, expectedErr: nil, expectedReadErr: nil, expectedVersion: database.NilVersion, expectedDirty: true},
-		{name: "last migration clean", version: database.NilVersion, dirty: false, expectedErr: nil, expectedReadErr: nil, expectedVersion: database.NilVersion, expectedDirty: false},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			err := d.SetVersion(tc.version, tc.dirty)
-			if err != tc.expectedErr {
-				t.Fatal("Got unexpected error:", err, "!=", tc.expectedErr)
-			}
-			v, dirty, readErr := d.Version()
-			if readErr != tc.expectedReadErr {
-				t.Fatal("Got unexpected error:", readErr, "!=", tc.expectedReadErr)
-			}
-			if v != tc.expectedVersion {
-				t.Error("Got unexpected version:", v, "!=", tc.expectedVersion)
-			}
-			if dirty != tc.expectedDirty {
-				t.Error("Got unexpected dirty value:", dirty, "!=", tc.dirty)
-			}
-		})
 	}
 }

@@ -5,7 +5,6 @@ go 1.25.11
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/dhui/dktest v0.4.6
-	github.com/jackc/pgerrcode v0.0.0-20220416144525-469b46aa5efa
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/lib/pq v1.10.9
 	github.com/moby/moby/api v1.54.2
