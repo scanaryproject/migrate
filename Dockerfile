@@ -1,26 +1,23 @@
-FROM golang:1.26-alpine3.24 AS builder
-ARG VERSION
+FROM golang:1.26-alpine AS builder
+ARG VERSION=dev
 
-RUN apk add --no-cache git gcc musl-dev make
+RUN apk add --no-cache make
 
-WORKDIR /go/src/github.com/golang-migrate/migrate
-
-ENV GO111MODULE=on
+WORKDIR /src
 
 COPY go.mod go.sum ./
-
 RUN go mod download
 
 COPY . ./
-
-RUN make build-docker
+RUN make build VERSION=${VERSION}
 
 FROM alpine:3.24
 
 RUN apk upgrade --no-cache \
     && apk add --no-cache ca-certificates
 
-COPY --from=builder /go/src/github.com/golang-migrate/migrate/build/migrate.linux-386 /usr/local/bin/migrate
+COPY --from=builder /src/migrate /usr/local/bin/migrate
+COPY cmd/migrate/migrate-up-all /usr/local/bin/migrate-up-all
 RUN ln -s /usr/local/bin/migrate /migrate
 
 ENTRYPOINT ["migrate"]

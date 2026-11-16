@@ -52,6 +52,25 @@ Database drivers: `postgres://` (lib/pq) and `pgx5://` (pgx v5). See
 [database/postgres](database/postgres) for URL options. Source drivers:
 `file://` and Go `io/fs`.
 
+## Docker
+
+Images are published to `ghcr.io/scanaryproject/migrate` by
+[`.github/workflows/docker.yaml`](.github/workflows/docker.yaml): `:latest`
+on every push to master, `:vX.Y.Z` on tags, or any tag via workflow dispatch.
+
+```bash
+docker run --rm -v "$PWD/db/migrations:/migrations:ro" --network host \
+  ghcr.io/scanaryproject/migrate:latest -path /migrations -database "$DB" up
+```
+
+The image also ships `migrate-up-all`, a shell loop that calls `migrate up`
+until nothing is pending. [`build/docker-compose.yaml`](build/docker-compose.yaml)
+is a copy-paste template that brings up Postgres and runs it:
+
+```bash
+cd build && docker compose up -d --wait postgres && docker compose up migrator
+```
+
 ## Ledger table
 
 Created on first connect as `schema_migrations` (override with

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Applies every pending migration by running `migrate ... up` once per
+# migration until it reports "no change". Any other failure stops the loop
+# and exits 1. All arguments are passed through to migrate, e.g.
+#
+#   migrate-up-all -path /migrations -database "$DB"
+set -u
+while :; do
+	out=$(migrate "$@" up 2>&1) || {
+		printf '%s\n' "$out" >&2
+		exit 1
+	}
+	printf '%s\n' "$out"
+	case "$out" in
+	*"no change"*) exit 0 ;;
+	esac
+done
