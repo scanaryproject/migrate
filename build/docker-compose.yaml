@@ -1,0 +1,33 @@
+# Template for projects that ship SQL migrations and need a database with
+# every migration applied, e.g. for integration tests:
+#
+#   cd build && docker compose up -d --wait postgres && docker compose up migrator
+#
+# Copy this file, point `volumes` at your migrations directory and pin the
+# image to a released tag instead of :latest.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrator:
+    image: ghcr.io/scanaryproject/migrate:latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../database/postgres/examples/migrations:/migrations:ro
+    # `migrate up` applies exactly one migration; migrate-up-all (shipped in
+    # the image) repeats it until nothing is pending.
+    entrypoint: ["migrate-up-all"]
+    command: ["-path", "/migrations", "-database", "postgres://user:password@postgres:5432/db?sslmode=disable"]

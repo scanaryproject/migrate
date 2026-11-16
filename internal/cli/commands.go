@@ -3,14 +3,15 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/stub" // TODO remove again
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
@@ -147,102 +148,48 @@ func createFile(filename string) error {
 	return f.Close()
 }
 
-func gotoCmd(m *migrate.Migrate, v uint) error {
-	if err := m.Migrate(v); err != nil {
-		if err != migrate.ErrNoChange {
-			return err
-		}
+func upCmd(m *migrate.Migrate) error {
+	return noChangeIsInfo(m.Up())
+}
+
+func downCmd(m *migrate.Migrate) error {
+	return noChangeIsInfo(m.Down())
+}
+
+// noChangeIsInfo turns migrate.ErrNoChange into a log line instead of a failure.
+func noChangeIsInfo(err error) error {
+	if errors.Is(err, migrate.ErrNoChange) {
 		log.Println(err)
+		return nil
 	}
-	return nil
-}
-
-func upCmd(m *migrate.Migrate, limit int) error {
-	if limit >= 0 {
-		if err := m.Steps(limit); err != nil {
-			if err != migrate.ErrNoChange {
-				return err
-			}
-			log.Println(err)
-		}
-	} else {
-		if err := m.Up(); err != nil {
-			if err != migrate.ErrNoChange {
-				return err
-			}
-			log.Println(err)
-		}
-	}
-	return nil
-}
-
-func downCmd(m *migrate.Migrate, limit int) error {
-	if limit >= 0 {
-		if err := m.Steps(-limit); err != nil {
-			if err != migrate.ErrNoChange {
-				return err
-			}
-			log.Println(err)
-		}
-	} else {
-		if err := m.Down(); err != nil {
-			if err != migrate.ErrNoChange {
-				return err
-			}
-			log.Println(err)
-		}
-	}
-	return nil
+	return err
 }
 
 func dropCmd(m *migrate.Migrate) error {
-	if err := m.Drop(); err != nil {
-		return err
-	}
-	return nil
+	return m.Drop()
 }
 
-func forceCmd(m *migrate.Migrate, v int) error {
-	if err := m.Force(v); err != nil {
-		return err
-	}
-	return nil
+func forceCmd(m *migrate.Migrate, v uint) error {
+	return m.Force(v)
 }
 
-func versionCmd(m *migrate.Migrate) error {
-	v, dirty, err := m.Version()
+func unforceCmd(m *migrate.Migrate, v uint) error {
+	return m.Unforce(v)
+}
+
+// statusCmd prints the ledger and pending versions as a table.
+func statusCmd(m *migrate.Migrate, w io.Writer) error {
+	st, err := m.Status()
 	if err != nil {
 		return err
 	}
-	if dirty {
-		log.Printf("%v (dirty)\n", v)
-	} else {
-		log.Println(v)
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "VERSION\tFILENAME\tMD5\tAPPLIED")
+	for _, a := range st.Applied {
+		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", a.Version, a.Filename, a.MD5Sum, a.AppliedAt.UTC().Format(time.RFC3339))
 	}
-	return nil
-}
-
-// numDownMigrationsFromArgs returns an int for number of migrations to apply
-// and a bool indicating if we need a confirm before applying
-func numDownMigrationsFromArgs(applyAll bool, args []string) (int, bool, error) {
-	if applyAll {
-		if len(args) > 0 {
-			return 0, false, errors.New("-all cannot be used with other arguments")
-		}
-		return -1, false, nil
+	for _, v := range st.Pending {
+		_, _ = fmt.Fprintf(tw, "%d\t-\t-\tpending\n", v)
 	}
-
-	switch len(args) {
-	case 0:
-		return -1, true, nil
-	case 1:
-		downValue := args[0]
-		n, err := strconv.ParseUint(downValue, 10, 64)
-		if err != nil {
-			return 0, false, errors.New("can't read limit argument N")
-		}
-		return int(n), false, nil
-	default:
-		return 0, false, errors.New("too many arguments")
-	}
+	return tw.Flush()
 }

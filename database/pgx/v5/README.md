@@ -25,17 +25,38 @@ This package is for [pgx/v5](https://pkg.go.dev/github.com/jackc/pgx/v5). A back
 | `sslmode` | | Whether or not to use SSL (disable\|require\|verify-ca\|verify-full) |
 
 
-## Upgrading from v1
+## Ledger table
 
-1. Write down the current migration version from schema_migrations
-1. `DROP TABLE schema_migrations`
-2. Wrap your existing migrations in transactions ([BEGIN/COMMIT](https://www.postgresql.org/docs/current/static/transaction-iso.html)) if you use multiple statements within one migration.
-3. Download and install the latest migrate version.
-4. Force the current migration version with `migrate force <current_version>`.
+Created on first connect (needs CREATE on the schema; later connects only need
+SELECT/INSERT/DELETE):
+
+```sql
+CREATE TABLE schema_migrations (
+  version      bigint      NOT NULL PRIMARY KEY,
+  filename     text        NOT NULL,
+  md5sum       char(32)    NOT NULL,
+  time_applied timestamptz NOT NULL DEFAULT now()
+);
+```
+
+A table with the legacy golang-migrate shape `(version, dirty)` under the same
+name is rejected with `legacy migrations table ... found`. Drop it or use
+`x-migrations-table`.
+
+## Transactions
+
+`Apply` runs the migration body and the ledger `INSERT` in one transaction,
+`Revert` runs the down body and the ledger `DELETE` in one transaction. A
+failing statement rolls back everything. Do not write `BEGIN`/`COMMIT` in
+migration files.
+
+A body whose first line is `-- migrate:no-transaction` runs outside a
+transaction (for `CREATE INDEX CONCURRENTLY` and friends); the ledger row is
+written afterwards in its own statement.
 
 ## Multi-statement mode
 
-In PostgreSQL running multiple SQL statements in one `Exec` executes them inside a transaction. Sometimes this
-behavior is not desirable because some statements can be only run outside of transaction (e.g.
-`CREATE INDEX CONCURRENTLY`). If you want to use `CREATE INDEX CONCURRENTLY` without activating multi-statement mode
-you have to put such statements in a separate migration files.
+Without `x-multi-statement`, the body is sent to Postgres in one `Exec`. With
+it, the body is split on `;` and each statement is executed on its own, which
+gives precise error positions and lets a `no-transaction` file hold several
+statements that each must run outside a transaction.

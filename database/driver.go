@@ -6,8 +6,8 @@ package database
 
 import (
 	"fmt"
-	"io"
 	"sync"
+	"time"
 
 	iurl "github.com/golang-migrate/migrate/v4/internal/url"
 )
@@ -17,7 +17,19 @@ var (
 	ErrNotLocked = fmt.Errorf("can't unlock, as not currently locked")
 )
 
-const NilVersion int = -1
+// NoTransactionMarker, when found at the very start of a migration body,
+// tells the driver to run the body outside of a transaction
+// (e.g. for CREATE INDEX CONCURRENTLY). The ledger row is then written
+// in a separate statement after the body succeeded.
+const NoTransactionMarker = "-- migrate:no-transaction"
+
+// AppliedMigration is one row of the migrations ledger table.
+type AppliedMigration struct {
+	Version   uint
+	Filename  string
+	MD5Sum    string // lowercase hex of md5 over the up migration body
+	AppliedAt time.Time
+}
 
 var driversMu sync.RWMutex
 var drivers = make(map[string]Driver)
@@ -32,7 +44,6 @@ var drivers = make(map[string]Driver)
 //  3. Add a test that calls database/testing.go:Test()
 //  4. Add own tests for Open(), WithInstance() (when provided) and Close().
 //     All other functions are tested by tests in database/testing.
-//     Saves you some time and makes sure all database drivers behave the same way.
 //  5. Call Register in init().
 //  6. Create a internal/cli/build_<driver-name>.go file
 //  7. Add driver name in 'DATABASE' variable in Makefile
@@ -53,27 +64,28 @@ type Driver interface {
 	Close() error
 
 	// Lock should acquire a database lock so that only one migration process
-	// can run at a time. Migrate will call this function before Run is called.
+	// can run at a time. Migrate will call this function before Apply/Revert.
 	// If the implementation can't provide this functionality, return nil.
 	// Return database.ErrLocked if database is already locked.
 	Lock() error
 
-	// Unlock should release the lock. Migrate will call this function after
-	// all migrations have been run.
+	// Unlock should release the lock.
 	Unlock() error
 
-	// Run applies a migration to the database. migration is guaranteed to be not nil.
-	Run(migration io.Reader) error
+	// Applied returns every recorded migration ordered by version ascending.
+	// An empty ledger returns an empty slice and no error.
+	Applied() ([]AppliedMigration, error)
 
-	// SetVersion saves version and dirty state.
-	// Migrate will call this function before and after each call to Run.
-	// version must be >= -1. -1 means NilVersion.
-	SetVersion(version int, dirty bool) error
+	// Apply runs body (the up migration) and records m in the ledger.
+	// body == nil means "record only" (used by force).
+	// Where the database supports it, body and the ledger insert run in
+	// one transaction, unless body starts with NoTransactionMarker.
+	Apply(m AppliedMigration, body []byte) error
 
-	// Version returns the currently active version and if the database is dirty.
-	// When no migration has been applied, it must return version -1.
-	// Dirty means, a previous migration failed and user interaction is required.
-	Version() (version int, dirty bool, err error)
+	// Revert runs body (the down migration) and deletes the ledger row for version.
+	// body == nil means "delete only" (used by unforce).
+	// Same transaction semantics as Apply.
+	Revert(version uint, body []byte) error
 
 	// Drop deletes everything in the database.
 	// Note that this is a breaking action, a new call to Open() is necessary to

@@ -2,71 +2,18 @@
 
 ## Installation
 
-### Download pre-built binary (Windows, MacOS, or Linux)
+### Pre-built binary
 
-[Release Downloads](https://github.com/golang-migrate/migrate/releases)
-
-```bash
-$ curl -L https://github.com/golang-migrate/migrate/releases/download/$version/migrate.$os-$arch.tar.gz | tar xvz
-```
-
-### MacOS
-
-```bash
-$ brew install golang-migrate
-```
-
-### Windows
-
-Using [scoop](https://scoop.sh/)
-
-```bash
-$ scoop install migrate
-```
-
-### Linux (*.deb package)
-
-```bash
-$ curl -fsSL https://packagecloud.io/golang-migrate/migrate/gpgkey | sudo gpg --dearmor -o /etc/apt/keyrings/migrate.gpg
-$ echo "deb [signed-by=/etc/apt/keyrings/migrate.gpg] https://packagecloud.io/golang-migrate/migrate/ubuntu/ $(lsb_release -sc) main" > /etc/apt/sources.list.d/migrate.list
-$ apt-get update
-$ apt-get install -y migrate
-```
+Download from this fork's GitHub releases and put `migrate` on your `PATH`.
 
 ### With Go toolchain
 
-#### Versioned
-
 ```bash
-$ go get -u -d github.com/golang-migrate/migrate/cmd/migrate
-$ cd $GOPATH/src/github.com/golang-migrate/migrate/cmd/migrate
-$ git checkout $TAG  # e.g. v4.1.0
-$ # Go 1.15 and below
-$ go build -tags 'postgres' -ldflags="-X main.Version=$(git describe --tags)" -o $GOPATH/bin/migrate $GOPATH/src/github.com/golang-migrate/migrate/cmd/migrate
-$ # Go 1.16+
-$ go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@$TAG
+$ go install -tags 'postgres pgx5' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 ```
 
-#### Unversioned
-
-```bash
-$ # Go 1.15 and below
-$ go get -tags 'postgres' -u github.com/golang-migrate/migrate/cmd/migrate
-$ # Go 1.16+
-$ go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-```
-
-#### Notes
-
-1. Requires a version of Go that [supports modules](https://golang.org/cmd/go/#hdr-Preliminary_module_support). e.g. Go 1.11+
-1. These examples build the cli which will only work with postgres.  In order
-to build the cli for use with other databases, replace the `postgres` build tag
-with the appropriate database tag(s) for the databases desired.  The tags
-correspond to the names of the sub-packages underneath the
-[`database`](../../database) package.
-1. Similarly to the database build tags, if you need to support other sources, use the appropriate build tag(s).
-1. Support for build constraints will be removed in the future: https://github.com/golang-migrate/migrate/issues/60
-1. For versions of Go 1.15 and lower, [make sure](https://github.com/golang-migrate/migrate/pull/257#issuecomment-705249902) you're not installing the `migrate` CLI from a module. e.g. there should not be any `go.mod` files in your current directory or any directory from your current directory to the root
+The build tags select database drivers: `postgres` (lib/pq) and/or `pgx5`
+(pgx v5). The `file` source is always included.
 
 ## Usage
 
@@ -79,7 +26,6 @@ Options:
   -source          Location of the migrations (driver://url)
   -path            Shorthand for -source=file://path
   -database        Run migrations against this database (driver://url)
-  -prefetch N      Number of migrations to load in advance before executing (default 10)
   -lock-timeout N  Allow N seconds to acquire database lock (default 15)
   -verbose         Print verbose logging
   -version         Print version
@@ -92,31 +38,29 @@ Commands:
            Use -format option to specify a Go time format string. Note: migrations with the same time cause "duplicate migration version" error.
            Use -tz option to specify the timezone that will be used when generating non-sequential migrations (defaults: UTC).
 
-  goto V       Migrate to version V
-  up [N]       Apply all or N up migrations
-  down [N] [-all]    Apply all or N down migrations
-        Use -all to apply all down migrations
+  up           Apply the next pending migration (exactly one)
+  down         Revert the most recently applied migration (exactly one)
+  status       Print applied migrations (version, filename, md5, time) and pending versions
+  force V      Record version V as applied without running it
+  unforce V    Remove version V from the ledger without running its down migration
   drop [-f]    Drop everything inside database
         Use -f to bypass confirmation
-  force V      Set version V but don't run migration (ignores dirty state)
-  version      Print current migration version
 ```
 
-So let's say you want to run the first two migrations
+Apply the next pending migration:
 
 ```bash
-$ migrate -source file://path/to/migrations -database postgres://localhost:5432/database up 2
+$ migrate -source file://path/to/migrations -database postgres://localhost:5432/database up
 ```
 
-If your migrations are hosted on github
+Apply everything that is pending:
 
 ```bash
-$ migrate -source github://mattes:personal-access-token@mattes/migrate_test \
-    -database postgres://localhost:5432/database down 2
+$ until ! migrate -path path/to/migrations -database "$DB" up 2>&1 | grep -v '^no change$'; do :; done
 ```
 
-The CLI will gracefully stop at a safe point when SIGINT (ctrl+c) is received.
-Send SIGKILL for immediate halt.
+Exit code is 0 for `up`/`down` when there was nothing to do (`no change` is
+printed), 1 on any error including checksum or ordering violations.
 
 ## Reading CLI arguments from somewhere else
 

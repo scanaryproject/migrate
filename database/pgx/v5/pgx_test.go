@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,12 +77,36 @@ func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
 	return true
 }
 
+// execSQL runs raw SQL through the driver connection without touching the ledger.
+func execSQL(d database.Driver, sql string) error {
+	p := d.(*Postgres)
+	return p.run(p.conn, []byte(sql))
+}
+
 func mustRun(t *testing.T, d database.Driver, statements []string) {
 	for _, statement := range statements {
-		if err := d.Run(strings.NewReader(statement)); err != nil {
+		if err := execSQL(d, statement); err != nil {
 			t.Fatal(err)
 		}
 	}
+}
+
+// appliedVersions returns the ledger versions, failing the test on error.
+func appliedVersions(t *testing.T, d database.Driver) []uint {
+	t.Helper()
+	rows, err := d.Applied()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs := make([]uint, 0, len(rows))
+	for _, r := range rows {
+		vs = append(vs, r.Version)
+	}
+	return vs
+}
+
+func row(v uint) database.AppliedMigration {
+	return database.AppliedMigration{Version: v, Filename: fmt.Sprintf("%d_test.up.sql", v), MD5Sum: "00000000000000000000000000000000"}
 }
 
 func Test(t *testing.T) {
@@ -150,7 +175,7 @@ func TestMultipleStatements(t *testing.T) {
 				t.Error(err)
 			}
 		}()
-		if err := d.Run(strings.NewReader("CREATE TABLE foo (foo text); CREATE TABLE bar (bar text);")); err != nil {
+		if err := execSQL(d, "CREATE TABLE foo (foo text); CREATE TABLE bar (bar text);"); err != nil {
 			t.Fatalf("expected err to be nil, got %v", err)
 		}
 
@@ -183,7 +208,7 @@ func TestMultipleStatementsInMultiStatementMode(t *testing.T) {
 				t.Error(err)
 			}
 		}()
-		if err := d.Run(strings.NewReader("CREATE TABLE foo (foo text); CREATE INDEX CONCURRENTLY idx_foo ON foo (foo);")); err != nil {
+		if err := execSQL(d, "CREATE TABLE foo (foo text); CREATE INDEX CONCURRENTLY idx_foo ON foo (foo);"); err != nil {
 			t.Fatalf("expected err to be nil, got %v", err)
 		}
 
@@ -219,7 +244,7 @@ func TestErrorParsing(t *testing.T) {
 
 		wantErr := `migration failed: syntax error at or near "TABLEE" (column 37) in line 1: CREATE TABLE foo ` +
 			`(foo text); CREATE TABLEE bar (bar text); (details: ERROR: syntax error at or near "TABLEE" (SQLSTATE 42601))`
-		if err := d.Run(strings.NewReader("CREATE TABLE foo (foo text); CREATE TABLEE bar (bar text);")); err == nil {
+		if err := execSQL(d, "CREATE TABLE foo (foo text); CREATE TABLEE bar (bar text);"); err == nil {
 			t.Fatal("expected err but got nil")
 		} else if err.Error() != wantErr {
 			t.Fatalf("expected '%s' but got '%s'", wantErr, err.Error())
@@ -268,15 +293,16 @@ func TestWithSchema(t *testing.T) {
 		}()
 
 		// create foobar schema
-		if err := d.Run(strings.NewReader("CREATE SCHEMA foobar AUTHORIZATION postgres")); err != nil {
+		if err := execSQL(d, "CREATE SCHEMA foobar AUTHORIZATION postgres"); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.SetVersion(1, false); err != nil {
+		if err := d.Apply(row(1), nil); err != nil {
 			t.Fatal(err)
 		}
 
 		// re-connect using that schema
-		d2, err := p.Open(pgConnectionString(ip, port, "search_path=foobar"))
+		d2, err := p.Open(fmt.Sprintf("postgres://postgres:%s@%v:%v/postgres?sslmode=disable&search_path=foobar",
+			pgPassword, ip, port))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -286,33 +312,21 @@ func TestWithSchema(t *testing.T) {
 			}
 		}()
 
-		version, _, err := d2.Version()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if version != database.NilVersion {
-			t.Fatal("expected NilVersion")
+		if vs := appliedVersions(t, d2); len(vs) != 0 {
+			t.Fatal("expected empty ledger in foobar schema, got", vs)
 		}
 
-		// now update version and compare
-		if err := d2.SetVersion(2, false); err != nil {
+		// now record a version in foobar and compare
+		if err := d2.Apply(row(2), nil); err != nil {
 			t.Fatal(err)
 		}
-		version, _, err = d2.Version()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if version != 2 {
-			t.Fatal("expected version 2")
+		if vs := appliedVersions(t, d2); !reflect.DeepEqual(vs, []uint{2}) {
+			t.Fatal("expected [2] in foobar schema, got", vs)
 		}
 
 		// meanwhile, the public schema still has the other version
-		version, _, err = d.Version()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if version != 1 {
-			t.Fatal("expected version 2")
+		if vs := appliedVersions(t, d); !reflect.DeepEqual(vs, []uint{1}) {
+			t.Fatal("expected [1] in public schema, got", vs)
 		}
 	})
 }
@@ -334,7 +348,7 @@ func TestMigrationTableOption(t *testing.T) {
 		}()
 
 		// create migrate schema
-		if err := d.Run(strings.NewReader("CREATE SCHEMA migrate AUTHORIZATION postgres")); err != nil {
+		if err := execSQL(d, "CREATE SCHEMA migrate AUTHORIZATION postgres"); err != nil {
 			t.Fatal(err)
 		}
 
@@ -394,7 +408,7 @@ func TestFailToCreateTableWithoutPermissions(t *testing.T) {
 
 		addr := pgConnectionString(ip, port)
 
-		// Check that opening the postgres connection returns NilVersion
+		// Check that opening the postgres connection works
 		p := &Postgres{}
 
 		d, err := p.Open(addr)
@@ -464,7 +478,7 @@ func TestCheckBeforeCreateTable(t *testing.T) {
 
 		addr := pgConnectionString(ip, port)
 
-		// Check that opening the postgres connection returns NilVersion
+		// Check that opening the postgres connection works
 		p := &Postgres{}
 
 		d, err := p.Open(addr)
@@ -514,14 +528,8 @@ func TestCheckBeforeCreateTable(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		version, _, err := d3.Version()
-
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if version != database.NilVersion {
-			t.Fatal("Unexpected version, want database.NilVersion. Got: ", version)
+		if vs := appliedVersions(t, d3); len(vs) != 0 {
+			t.Fatal("Unexpected ledger, want empty. Got: ", vs)
 		}
 
 		defer func() {
@@ -552,10 +560,10 @@ func TestParallelSchema(t *testing.T) {
 		}()
 
 		// create foo and bar schemas
-		if err := d.Run(strings.NewReader("CREATE SCHEMA foo AUTHORIZATION postgres")); err != nil {
+		if err := execSQL(d, "CREATE SCHEMA foo AUTHORIZATION postgres"); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.Run(strings.NewReader("CREATE SCHEMA bar AUTHORIZATION postgres")); err != nil {
+		if err := execSQL(d, "CREATE SCHEMA bar AUTHORIZATION postgres"); err != nil {
 			t.Fatal(err)
 		}
 

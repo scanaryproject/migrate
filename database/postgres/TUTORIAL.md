@@ -39,12 +39,13 @@ And in the `.down.sql` let's delete it:
 ```sql
 DROP TABLE IF EXISTS users;
 ```
-By adding `IF EXISTS/IF NOT EXISTS` we are making migrations idempotent - you can read more about idempotency in [getting started](../../GETTING_STARTED.md#create-migrations)
+By adding `IF EXISTS/IF NOT EXISTS` we are making migrations idempotent.
 
 ## Run migrations
 ```
 migrate -database ${POSTGRESQL_URL} -path db/migrations up
 ```
+`up` applies exactly one pending migration. `migrate ... status` shows what is applied (with md5 and time) and what is pending.
 Let's check if the table was created properly by running `psql example -c "\d users"`.
 The output you are supposed to see:
 ```
@@ -76,30 +77,23 @@ Again, it should create for us two migrations files:
 - 000002_add_mood_to_users.down.sql
 - 000002_add_mood_to_users.up.sql
 
-In Postgres, when we want our queries to be done in a transaction, we need to wrap it with `BEGIN` and `COMMIT` commands.
+Every migration runs inside a transaction together with its ledger row, so do not write `BEGIN`/`COMMIT` yourself.
 In our example, we are going to add a column to our database that can only accept enumerable values or NULL.
 Migration up:
 ```sql
-BEGIN;
-
 CREATE TYPE enum_mood AS ENUM (
 	'happy',
 	'sad',
 	'neutral'
 );
 ALTER TABLE users ADD COLUMN mood enum_mood;
-
-COMMIT;
 ```
 Migration down:
 ```sql
-BEGIN;
-
 ALTER TABLE users DROP COLUMN mood;
 DROP TYPE enum_mood;
-
-COMMIT;
 ```
+If the `ALTER TABLE` failed, the `CREATE TYPE` would be rolled back too and nothing would be recorded.
 
 Now we can run our new migration and check the database:
 ```
@@ -126,6 +120,7 @@ Indexes:
 Here is a very simple app running migrations for the above configuration:
 ```go
 import (
+	"errors"
 	"log"
 
 	"github.com/golang-migrate/migrate/v4"
@@ -140,19 +135,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := m.Up(); err != nil {
-		log.Fatal(err)
+	// apply everything that is pending, one migration at a time
+	for {
+		err := m.Up()
+		if errors.Is(err, migrate.ErrNoChange) {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 ```
-You can find details [here](README.md#use-in-your-go-project)
 
 ## Fix issue where migrations run twice
 
 When the schema and role names are the same, you might run into issues if you create this schema using migrations.
 This is caused by the fact that the [default `search_path`](https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PATH) is `"$user", public`.
 In the first run (with an empty database) the migrate table is created in `public`.
-When the migrations create the `$user` schema, the next run will store (a new) migrate table in this schema (due to order of schemas in `search_path`) and tries to apply all migrations again (most likely failing).
+When the migrations create the `$user` schema, the next run will store (a new) migrate table in this schema (due to order of schemas in `search_path`) and tries to apply the first migration again (most likely failing).
 
 To solve this you need to change the default `search_path` by removing the `$user` component, so the migrate table is always stored in the (available) `public` schema.
 This can be done using the [`search_path` query parameter in the URL](https://github.com/jexia/migrate/blob/fix-postgres-version-table/database/postgres/README.md#postgres).

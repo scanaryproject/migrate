@@ -132,7 +132,7 @@ func (d *PartialDriver) ReadUp(version uint) (r io.ReadCloser, identifier string
 		if err != nil {
 			return nil, "", err
 		}
-		return body, m.Identifier, nil
+		return body, m.Raw, nil
 	}
 	return nil, "", &fs.PathError{
 		Op:   "read up for version " + strconv.FormatUint(uint64(version), 10),
@@ -148,7 +148,7 @@ func (d *PartialDriver) ReadDown(version uint) (r io.ReadCloser, identifier stri
 		if err != nil {
 			return nil, "", err
 		}
-		return body, m.Identifier, nil
+		return body, m.Raw, nil
 	}
 	return nil, "", &fs.PathError{
 		Op:   "read down for version " + strconv.FormatUint(uint64(version), 10),
