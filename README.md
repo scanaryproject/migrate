@@ -55,8 +55,9 @@ Database drivers: `postgres://` (lib/pq) and `pgx5://` (pgx v5). See
 ## Docker
 
 Images are published to `ghcr.io/scanaryproject/migrate` by
-[`.github/workflows/docker.yaml`](.github/workflows/docker.yaml): `:latest`
-on every push to master, `:vX.Y.Z` on tags, or any tag via workflow dispatch.
+[`.github/workflows/docker.yaml`](.github/workflows/docker.yaml): every push to
+master produces `:<unix timestamp>` and `:latest` (same scheme as scanaryd);
+workflow dispatch takes an explicit tag. Pin the timestamp tag in consumers.
 
 ```bash
 docker run --rm -v "$PWD/db/migrations:/migrations:ro" --network host \
