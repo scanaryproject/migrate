@@ -40,6 +40,8 @@ Commands:
 
   up           Apply the next pending migration (exactly one)
   down         Revert the most recently applied migration (exactly one)
+  down-to V    Revert migrations, newest first, until V is the highest applied one
+        Use V=0 to revert everything
   status       Print applied migrations (version, filename, md5, time) and pending versions
   force V      Record version V as applied without running it
   unforce V    Remove version V from the ledger without running its down migration
@@ -59,7 +61,7 @@ Apply everything that is pending:
 $ until ! migrate -path path/to/migrations -database "$DB" up 2>&1 | grep -v '^no change$'; do :; done
 ```
 
-Exit code is 0 for `up`/`down` when there was nothing to do (`no change` is
+Exit code is 0 for `up`/`down`/`down-to` when there was nothing to do (`no change` is
 printed), 1 on any error including checksum or ordering violations.
 
 ## Reading CLI arguments from somewhere else

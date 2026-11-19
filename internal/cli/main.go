@@ -22,8 +22,10 @@ const (
 	   Use -format option to specify a Go time format string. Note: migrations with the same time cause "duplicate migration version" error.
            Use -tz option to specify the timezone that will be used when generating non-sequential migrations (defaults: UTC).
 `
-	upUsage      = `up           Apply the next pending migration (exactly one)`
-	downUsage    = `down         Revert the most recently applied migration (exactly one)`
+	upUsage     = `up           Apply the next pending migration (exactly one)`
+	downUsage   = `down         Revert the most recently applied migration (exactly one)`
+	downToUsage = `down-to V    Revert migrations, newest first, until V is the highest applied one
+	Use V=0 to revert everything`
 	statusUsage  = `status       Print applied migrations (version, filename, md5, time) and pending versions`
 	forceUsage   = `force V      Record version V as applied without running it`
 	unforceUsage = `unforce V    Remove version V from the ledger without running its down migration`
@@ -97,9 +99,10 @@ Commands:
   %s
   %s
   %s
+  %s
 
 Source drivers: `+strings.Join(source.List(), ", ")+`
-Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, upUsage, downUsage, statusUsage, forceUsage, unforceUsage, dropUsage)
+Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, upUsage, downUsage, downToUsage, statusUsage, forceUsage, unforceUsage, dropUsage)
 	}
 
 	flag.Parse()
@@ -212,6 +215,9 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, upUsa
 
 	case "down":
 		runCmd("down", downUsage, 0, func(*flag.FlagSet) error { return downCmd(migrater) })
+
+	case "down-to":
+		runCmd("down-to", downToUsage, 1, func(fs *flag.FlagSet) error { return downToCmd(migrater, parseVersionArg(fs)) })
 
 	case "status":
 		runCmd("status", statusUsage, 0, func(*flag.FlagSet) error { return statusCmd(migrater, os.Stdout) })
