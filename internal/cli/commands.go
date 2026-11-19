@@ -156,6 +156,10 @@ func downCmd(m *migrate.Migrate) error {
 	return noChangeIsInfo(m.Down())
 }
 
+func downToCmd(m *migrate.Migrate, v uint) error {
+	return noChangeIsInfo(m.DownTo(v))
+}
+
 // noChangeIsInfo turns migrate.ErrNoChange into a log line instead of a failure.
 func noChangeIsInfo(err error) error {
 	if errors.Is(err, migrate.ErrNoChange) {

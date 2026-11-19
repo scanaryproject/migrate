@@ -270,6 +270,55 @@ func (m *Migrate) down() error {
 	if len(st.Applied) == 0 {
 		return ErrNoChange
 	}
+	return m.revertLast(st)
+}
+
+// DownTo validates the ledger and reverts applied migrations, highest first,
+// until the highest applied version is <= target. Each migration is reverted in
+// its own transaction and the ledger is re-validated before every step, so a
+// failure leaves the database at a consistent intermediate version.
+// target must be 0 (revert everything) or an applied version.
+// Returns ErrNoChange when nothing is above target.
+func (m *Migrate) DownTo(target uint) error {
+	if err := m.lock(); err != nil {
+		return err
+	}
+	return m.unlockErr(m.downTo(target))
+}
+
+func (m *Migrate) downTo(target uint) error {
+	st, err := m.status()
+	if err != nil {
+		return err
+	}
+	if target != 0 {
+		found := false
+		for _, a := range st.Applied {
+			if a.Version == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("version %d is not applied", target)
+		}
+	}
+	if len(st.Applied) == 0 || st.Applied[len(st.Applied)-1].Version <= target {
+		return ErrNoChange
+	}
+	for len(st.Applied) > 0 && st.Applied[len(st.Applied)-1].Version > target {
+		if err := m.revertLast(st); err != nil {
+			return err
+		}
+		if st, err = m.status(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// revertLast runs the down migration of the highest applied version in st.
+func (m *Migrate) revertLast(st Status) error {
 	v := st.Applied[len(st.Applied)-1].Version
 
 	r, filename, err := m.sourceDrv.ReadDown(v)

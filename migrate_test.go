@@ -323,6 +323,77 @@ func TestDownOneAtATime(t *testing.T) {
 	}
 }
 
+func TestDownTo(t *testing.T) {
+	m, _, db := newStubMigrate(t)
+	for i := 0; i < 4; i++ {
+		mustUp(t, m)
+	}
+
+	// target not applied
+	if err := m.DownTo(5); err == nil {
+		t.Fatal("DownTo(5): expected error for unapplied target")
+	}
+	if vs := appliedVersions(t, db); !reflect.DeepEqual(vs, []uint{1, 3, 4, 7}) {
+		t.Fatalf("ledger must be untouched after rejected target: %v", vs)
+	}
+
+	// target is the current max
+	if err := m.DownTo(7); !errors.Is(err, ErrNoChange) {
+		t.Fatalf("DownTo(7): expected ErrNoChange, got %v", err)
+	}
+
+	if err := m.DownTo(3); err != nil {
+		t.Fatal(err)
+	}
+	if vs := appliedVersions(t, db); !reflect.DeepEqual(vs, []uint{1, 3}) {
+		t.Fatalf("after DownTo(3): %v", vs)
+	}
+	n := len(db.MigrationSequence)
+	if !reflect.DeepEqual(db.MigrationSequence[n-2:], []string{"DROP 7", "DROP 4"}) {
+		t.Fatalf("expected DROP 7 then DROP 4, got %v", db.MigrationSequence)
+	}
+
+	// 0 reverts everything
+	if err := m.DownTo(0); err != nil {
+		t.Fatal(err)
+	}
+	if vs := appliedVersions(t, db); len(vs) != 0 {
+		t.Fatalf("after DownTo(0): %v", vs)
+	}
+	if err := m.DownTo(0); !errors.Is(err, ErrNoChange) {
+		t.Fatalf("DownTo(0) on empty ledger: expected ErrNoChange, got %v", err)
+	}
+}
+
+func TestDownToStopsAtMissingDownFile(t *testing.T) {
+	m, src, db := newStubMigrate(t)
+	for i := 0; i < 3; i++ {
+		mustUp(t, m)
+	}
+	// remove the down file of version 3; 4 above it still reverts, then we stop
+	ms := source.NewMigrations()
+	for _, v := range []uint{1, 3, 4, 7} {
+		up, _ := src.Migrations.Up(v)
+		ms.Append(up)
+		if v != 3 {
+			down, _ := src.Migrations.Down(v)
+			ms.Append(down)
+		}
+	}
+	src.Migrations = ms
+
+	var want ErrNoDownMigration
+	if err := m.DownTo(1); !errors.As(err, &want) || want.Version != 3 {
+		t.Fatalf("expected ErrNoDownMigration{3}, got %v", err)
+	}
+	if vs := appliedVersions(t, db); !reflect.DeepEqual(vs, []uint{1, 3}) {
+		t.Fatalf("expected 4 reverted and 3 kept, got %v", vs)
+	}
+	if err := m.lock(); err != nil {
+		t.Fatalf("lock must be released after failure, got %v", err)
+	}
+}
+
 func TestDownWithoutDownFile(t *testing.T) {
 	m, src, _ := newStubMigrate(t)
 	mustUp(t, m)

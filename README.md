@@ -7,7 +7,8 @@ different model:
 * **Ledger, not a version pointer.** The database keeps one row per applied
   migration: `version`, `filename`, `md5sum`, `time_applied`.
 * **One step per invocation.** `up` applies exactly the next pending migration,
-  `down` reverts exactly the last applied one. No `up N`, no `goto`.
+  `down` reverts exactly the last applied one. `down-to V` is the only
+  multi-step command and only goes backwards. No `up N`, no `goto`.
 * **Checksums are enforced.** Before every `up`, `down` or `status` the md5 of
   every applied migration's local up file is compared with the ledger. A
   mismatch fails the command.
@@ -35,6 +36,7 @@ migrate create -ext sql -dir db/migrations -seq create_users   # 000001_create_u
 migrate -path db/migrations -database "$DB" status             # ledger + pending versions
 migrate -path db/migrations -database "$DB" up                 # apply next pending migration
 migrate -path db/migrations -database "$DB" down               # revert last applied migration
+migrate -path db/migrations -database "$DB" down-to 3          # revert until 3 is the highest applied (0 = all)
 migrate -path db/migrations -database "$DB" force 3            # record version 3 as applied, run nothing
 migrate -path db/migrations -database "$DB" unforce 3          # forget version 3, run nothing
 migrate -path db/migrations -database "$DB" drop -f            # drop every table in the schema

@@ -31,7 +31,9 @@ is not checked; use `.sql` for SQL. Common schemes:
   everything already applied. If a lower version shows up (merge of an old
   branch), renumber it.
 * **One step at a time.** `up` applies the lowest pending version, `down`
-  reverts the highest applied one. Run them in a loop if you want more.
+  reverts the highest applied one. `down-to V` reverts repeatedly, one
+  transaction per migration with the ledger re-validated between steps, until
+  `V` is the highest applied version.
 
 ## Content
 
