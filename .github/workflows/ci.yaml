@@ -7,7 +7,7 @@ on:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-latest
+    runs-on: k3s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -19,7 +19,7 @@ jobs:
           version: v2.11.4
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: k3s
     strategy:
       matrix:
         go: ["1.25.x", "1.26.x"]
@@ -43,7 +43,7 @@ jobs:
   check-coverage:
     name: Check coverage
     needs: [test]
-    runs-on: ubuntu-latest
+    runs-on: k3s
     steps:
       - uses: shogo82148/actions-goveralls@v1
         with:
@@ -52,7 +52,7 @@ jobs:
   goreleaser:
     name: Release a new version
     needs: [lint, test]
-    runs-on: ubuntu-latest
+    runs-on: k3s
     environment: GoReleaser
     # This job only runs when
     # 1. When the previous `lint` and `test` jobs has completed successfully
